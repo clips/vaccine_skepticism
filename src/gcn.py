@@ -68,12 +68,6 @@ def train(g, labels, args):
            train_mask.int().sum().item(),
            val_mask.int().sum().item()))
 
-    # normalization
-    degs = g.in_degrees().float()
-    norm = torch.pow(degs, -0.5)
-    norm[torch.isinf(norm)] = 0
-    g.ndata['norm'] = norm.unsqueeze(1)
-
     # create model
     model = GCN(g,
                 in_feats,
