@@ -3,228 +3,119 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import dgl
-from dgl.nn.pytorch import GraphConv, HeteroGraphConv, WeightBasis
+import dgl.function as fn
 
 from .util import evaluate
 
-class RGCN(nn.Module):
-    """Relational Graph Convolutional Network
-    - Paper: https://arxiv.org/abs/1609.02907
-    - Code: https://github.com/tkipf/gcn
-    """
+class RGCNLayer(nn.Module):
     def __init__(self,
                  g,
-                 h_dim, 
-                 out_dim,
-                 num_hidden_layers=1,
-                 dropout=0,
-                 self_loop=False):
-        super(RGCN, self).__init__()
-        self.g = g
-        self.h_dim = h_dim
-        self.out_dim = out_dim
-        self.rel_names = list(set(g.etypes))
-        self.rel_names.sort()
-        self.num_bases = len(self.rel_names)
-        self.num_hidden_layers = num_hidden_layers
-        self.dropout = dropout
-        self.self_loop = self_loop
-
-        self.embed_layer = RelGraphEmbed(g, self.h_dim)
-        self.layers = nn.ModuleList()
-        # i2h
-        self.layers.append(RelGraphConvLayer(
-            self.h_dim, self.h_dim, self.rel_names,
-            self.num_bases, activation=F.relu, self_loop=self.self_loop,
-            dropout=self.dropout, weight=False))
-        # h2h
-        for i in range(self.num_hidden_layers):
-            self.layers.append(RelGraphConvLayer(
-                self.h_dim, self.h_dim, self.rel_names,
-                self.num_bases, activation=F.relu, self_loop=self.self_loop,
-                dropout=self.dropout))
-        # h2o
-        self.layers.append(RelGraphConvLayer(
-            self.h_dim, self.out_dim, self.rel_names,
-            self.num_bases, activation=None,
-            self_loop=self.self_loop))
-
-    def forward(self, h=None, blocks=None):
-        if h is None:
-            # full graph training
-            h = self.embed_layer()
-        if blocks is None:
-            # full graph training
-            for layer in self.layers:
-                h = layer(self.g, h)
-        else:
-            # minibatch training
-            for layer, block in zip(self.layers, blocks):
-                h = layer(block, h)
-        return h
-
-
-class RelGraphConvLayer(nn.Module):
-    """Relational Graph Convolution Layer."""
-    def __init__(self,
-                 in_feat,
-                 out_feat,
-                 rel_names,
-                 num_bases,
-                 *,
-                 weight=True,
-                 bias=True,
-                 activation=None,
-                 self_loop=False,
-                 dropout=0.0):
-        super(RelGraphConvLayer, self).__init__()
-        self.in_feat = in_feat
-        self.out_feat = out_feat
-        self.rel_names = rel_names
-        self.num_bases = num_bases
-        self.bias = bias
-        self.activation = activation
-        self.self_loop = self_loop
-
-        self.conv = HeteroGraphConv({
-                rel : GraphConv(in_feat, out_feat, norm='right', weight=False, bias=False)
-                for rel in rel_names
+                 in_feats,
+                 n_classes):
+        super(RGCNLayer, self).__init__()
+        self.weight = nn.ModuleDict({
+                name : nn.Linear(in_feats, n_classes) for name in g.etypes
             })
 
-        self.use_weight = weight
-        self.use_basis = num_bases < len(self.rel_names) and weight
-        if self.use_weight:
-            if self.use_basis:
-                self.basis = WeightBasis((in_feat, out_feat), num_bases, len(self.rel_names))
-            else:
-                self.weight = nn.Parameter(torch.Tensor(len(self.rel_names), in_feat, out_feat))
-                nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain('relu'))
+    def forward(self, g, feat_dict):
+        funcs = {}
+        for srctype, etype, dsttype in g.canonical_etypes:
+            Wh = self.weight[etype](feat_dict[srctype])
+            g.nodes[srctype].data['Wh_%s' % etype] = Wh
+            funcs[etype] = (fn.copy_u('Wh_%s' % etype, 'm'), fn.mean('m', 'h'))
+        g.multi_update_all(funcs, 'sum')
+        return {ntype : g.nodes[ntype].data['h'] for ntype in g.ntypes}
 
-        # bias
-        if bias:
-            self.h_bias = nn.Parameter(torch.Tensor(out_feat))
-            nn.init.zeros_(self.h_bias)
+class RGCN(nn.Module):
+    def __init__(self, 
+                 g, 
+                 in_feats, 
+                 n_hidden, 
+                 n_classes,
+                 n_layers,
+                 activation,
+                 dropout,
+                 category):
+        super(RGCN, self).__init__()
 
-        # weight for self loop
-        if self.self_loop:
-            self.loop_weight = nn.Parameter(torch.Tensor(in_feat, out_feat))
-            nn.init.xavier_uniform_(self.loop_weight,
-                                    gain=nn.init.calculate_gain('relu'))
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, g, inputs):
-        g = g.local_var()
-        if self.use_weight:
-            weight = self.basis() if self.use_basis else self.weight
-            wdict = {self.rel_names[i] : {'weight' : w.squeeze(0)}
-                     for i, w in enumerate(torch.split(weight, 1, dim=0))}
-        else:
-            wdict = {}
-
-        if g.is_block:
-            inputs_src = inputs
-            inputs_dst = {k: v[:g.number_of_dst_nodes(k)] for k, v in inputs.items()}
-        else:
-            inputs_src = inputs_dst = inputs
-
-        hs = self.conv(g, inputs, mod_kwargs=wdict)
-
-        def _apply(ntype, h):
-            if self.self_loop:
-                h = h + torch.matmul(inputs_dst[ntype], self.loop_weight)
-            if self.bias:
-                h = h + self.h_bias
-            if self.activation:
-                h = self.activation(h)
-            return self.dropout(h)
-        return {ntype : _apply(ntype, h) for ntype, h in hs.items()}
-
-class RelGraphEmbed(nn.Module):
-    """Embedding Layer"""
-    def __init__(self,
-                 g,
-                 embed_size,
-                 embed_name='embed',
-                 activation=None,
-                 dropout=0.0):
-        super(RelGraphEmbed, self).__init__()
-        self.g = g
-        self.embed_size = embed_size
-        self.embed_name = embed_name
+        embed_dict = {ntype : nn.Parameter(torch.Tensor(g.number_of_nodes(ntype), in_feats))
+                      for ntype in g.ntypes}
+        for key, embed in embed_dict.items():
+            nn.init.xavier_uniform_(embed)
+        self.embed = nn.ParameterDict(embed_dict)
         self.activation = activation
-        self.dropout = nn.Dropout(dropout)
+        self.category = category
+        
+        self.layers = nn.ModuleList()
+        # input layer
+        self.layers.append(RGCNLayer(g, in_feats, n_hidden))
+        # hidden layers
+        for i in range(n_layers - 1):
+            self.layers.append(RGCNLayer(g, n_hidden, n_hidden))
+        # output layer
+        self.layers.append(RGCNLayer(g, n_hidden, n_classes))
+        self.dropout = nn.Dropout(p=dropout)
 
-        # create weight embeddings for each node for each relation
-        self.embeds = nn.ParameterDict()
-        for ntype in g.ntypes:
-            embed = nn.Parameter(torch.Tensor(g.number_of_nodes(ntype), self.embed_size))
-            nn.init.xavier_uniform_(embed, gain=nn.init.calculate_gain('relu'))
-            self.embeds[ntype] = embed
-
-    def forward(self):
-        return self.embeds
-
+    def forward(self, g):
+        for i, layer in enumerate(self.layers):
+            if i != 0:
+                h_dict = layer(g, h_dict)
+                h_dict = {k: self.dropout(h) for k, h in h_dict.items()}
+            else:
+                h_dict = layer(g, self.embed)
+                h_dict = {k : self.activation(h) for k, h in h_dict.items()}
+        return h_dict[self.category]
+    
 def train(g, labels, args):
     category = 'user'
     
     n_classes = labels.unique().size(dim=0)
-    n_nodes = g.number_of_nodes()
+    n_nodes = g.num_nodes(category)
     n_edges = g.number_of_edges()
-    n_users = g.num_nodes(category)
     
-    n_train = int(n_users * 0.6)
-    n_val = int(n_users * 0.2)
-    train_mask = torch.zeros(n_users, dtype=torch.bool)
-    val_mask = torch.zeros(n_users, dtype=torch.bool)
-    test_mask = torch.zeros(n_users, dtype=torch.bool)
+    n_train = int(n_nodes * args.train_size)
+    
+    train_mask = torch.zeros(n_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(n_nodes, dtype=torch.bool)
     train_mask[:n_train] = True
-    val_mask[n_train:n_train + n_val] = True
-    test_mask[n_train + n_val:] = True
- 
+    val_mask[n_train:] = True
+    
     print("""----Data statistics------'
       #Nodes %d
       #Edges %d
       #Train samples %d
-      #Val samples %d
-      #Test samples %d""" %
+      #Val samples %d""" %
           (n_nodes,
-              n_edges,
-              train_mask.int().sum().item(),
-              val_mask.int().sum().item(),
-              test_mask.int().sum().item()))
+           n_edges,
+           train_mask.int().sum().item(),
+           val_mask.int().sum().item()))
 
     # create model
     model = RGCN(g,
                  args.n_hidden,
-                 n_classes,
-                 num_hidden_layers=args.n_layers - 2,
-                 dropout=args.dropout,
-                 self_loop=args.self_loop)
+                 args.n_hidden,
+                 2,
+                 0,
+                 F.relu,
+                 args.dropout,
+                 category)
 
     # use cross entropy loss
     loss_fcn = torch.nn.CrossEntropyLoss()
-    
-    # optimizer
+
+    # use optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # training loop
-    model.train()
     for epoch in range(args.n_epochs):
-        optimizer.zero_grad()
-       
-        logits = model()[category]
-        loss = loss_fcn(logits[train_mask], labels[train_mask])
+        
+        # forward
+        logits = model(g)
+        loss = F.cross_entropy(logits[train_mask], labels[train_mask])
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-            
+        
         acc = evaluate(model, logits, labels, val_mask)
         print("Epoch {:05d} | Loss {:.4f} | Accuracy {:.4f}". format(epoch, loss.item(), acc))
-        
-    print()
-    logits = model()[category]
-    loss = F.cross_entropy(logits[test_mask], labels[test_mask])
-    acc = evaluate(model, logits, labels, test_mask)
-    print("Test Accuracy: {:.4f} | Test loss: {:.4f}".format(acc, loss.item()))

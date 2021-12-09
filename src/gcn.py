@@ -51,32 +51,27 @@ def train(g, labels, args):
     n_nodes = g.number_of_nodes()
     n_edges = g.number_of_edges()
     
-    n_train = int(n_nodes * 0.6)
-    n_val = int(n_nodes * 0.2)
+    n_train = int(n_nodes * args.train_size)
+    
     train_mask = torch.zeros(n_nodes, dtype=torch.bool)
     val_mask = torch.zeros(n_nodes, dtype=torch.bool)
-    test_mask = torch.zeros(n_nodes, dtype=torch.bool)
     train_mask[:n_train] = True
-    val_mask[n_train:n_train + n_val] = True
-    test_mask[n_train + n_val:] = True
+    val_mask[n_train:] = True
 
     print("""----Data statistics------'
       #Nodes %d
       #Edges %d
       #Train samples %d
-      #Val samples %d
-      #Test samples %d""" %
+      #Val samples %d""" %
           (n_nodes,
            n_edges,
            train_mask.int().sum().item(),
-           val_mask.int().sum().item(),
-           test_mask.int().sum().item()))
+           val_mask.int().sum().item()))
 
     # normalization
     degs = g.in_degrees().float()
     norm = torch.pow(degs, -0.5)
     norm[torch.isinf(norm)] = 0
-
     g.ndata['norm'] = norm.unsqueeze(1)
 
     # create model
@@ -100,6 +95,7 @@ def train(g, labels, args):
 
         # forward
         logits = model(features)
+        _, indices = torch.max(logits, dim=1)
         loss = loss_fcn(logits[train_mask], labels[train_mask])
 
         optimizer.zero_grad()
@@ -108,9 +104,3 @@ def train(g, labels, args):
 
         acc = evaluate(model, logits, labels, val_mask)
         print("Epoch {:05d} | Loss {:.4f} | Accuracy {:.4f}". format(epoch, loss.item(), acc))
-
-    print()
-    logits = model(features)
-    loss = loss_fcn(logits[test_mask], labels[test_mask])
-    acc = evaluate(model, logits, labels, test_mask)
-    print("Test Accuracy: {:.4f} | Test loss: {:.4f}".format(acc, loss.item()))
